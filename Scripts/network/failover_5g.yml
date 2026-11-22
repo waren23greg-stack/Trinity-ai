@@ -1,0 +1,95 @@
+# Nightingale-AI Playbook: 5G Failover
+# Reroutes traffic from primary ISP to cellular backup when primary fails.
+# Idempotent: safe to run multiple times.
+# Returns: structured JSON result for orchestrator consumption.
+
+- name: Failover to 5G Cellular Backup
+  hosts: router_v
+  gather_facts: no
+  vars:
+    primary_wan_interface: "wan1"
+    backup_wan_interface: "wan2"  # USB 5G dongle
+    backup_gateway: "192.168.8.1"
+    health_check_target: "8.8.8.8"
+    health_check_count: 3
+    health_check_timeout: 2
+
+  tasks:
+    # ===== STEP 1: CONFIRM PRIMARY WAN IS ACTUALLY DOWN =====
+    # Never failover unless we're sure the primary is dead.
+    # A transient blip shouldn't trigger a 5G failover (costs money per MB).
+    - name: Verify primary WAN is truly down
+      ansible.builtin.shell: |
+        ping -c {{ health_check_count }} -W {{ health_check_timeout }} {{ health_check_target }} -I {{ primary_wan_interface }}
+      register: primary_wan_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Abort if primary WAN is healthy
+      ansible.builtin.debug:
+        msg: "Primary WAN is UP. Aborting failover—no action needed."
+      when: primary_wan_check.rc == 0
+      notify: abort_playbook
+
+    # ===== STEP 2: VERIFY BACKUP WAN IS AVAILABLE =====
+    - name: Check 5G backup interface status
+      ansible.builtin.shell: |
+        ip link show {{ backup_wan_interface }} | grep -q "state UP"
+      register: backup_wan_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Fail if backup interface is not available
+      ansible.builtin.fail:
+        msg: "5G backup interface {{ backup_wan_interface }} is DOWN. Cannot failover. Escalate to Warren."
+      when: backup_wan_status.rc != 0
+
+    # ===== STEP 3: EXECUTE FAILOVER =====
+    # Idempotent: if we're already on backup, do nothing.
+    - name: Check current default route
+      ansible.builtin.shell: |
+        ip route show default | grep -q "{{ backup_gateway }}"
+      register: current_route
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Switch default route to 5G backup
+      ansible.builtin.shell: |
+        ip route replace default via {{ backup_gateway }} dev {{ backup_wan_interface }} metric 50
+        ip route replace default via {{ primary_wan_interface }} metric 100
+      when: current_route.rc != 0
+      register: failover_result
+
+    # ===== STEP 4: VERIFY CONNECTIVITY =====
+    # Don't declare victory until we've proven the internet works.
+    - name: Verify internet connectivity via 5G
+      ansible.builtin.shell: |
+        ping -c {{ health_check_count }} -W {{ health_check_timeout }} {{ health_check_target }} -I {{ backup_wan_interface }}
+      register: post_failover_check
+      ignore_errors: yes
+      retries: 3
+      delay: 2
+      until: post_failover_check.rc == 0
+
+    # ===== STEP 5: RETURN STRUCTURED RESULT =====
+    - name: Return structured result to orchestrator
+      ansible.builtin.debug:
+        msg:
+          status: "{{ 'success' if post_failover_check.rc == 0 else 'failure' }}"
+          action: "failover_5g"
+          primary_wan: "{{ primary_wan_interface }}"
+          backup_wan: "{{ backup_wan_interface }}"
+          connectivity_verified: "{{ post_failover_check.rc == 0 }}"
+          failover_time_seconds: "{{ ansible_date_time.epoch | int - start_time | default(0) }}"
+          error: "{{ post_failover_check.stderr if post_failover_check.rc != 0 else '' }}"
+      register: result
+
+    - name: Output result as JSON for orchestrator
+      ansible.builtin.copy:
+        content: "{{ result.msg | to_nice_json }}"
+        dest: "/tmp/nightingale_result.json"
+      changed_when: false
+
+  handlers:
+    - name: abort_playbook
+      ansible.builtin.meta: end_play
