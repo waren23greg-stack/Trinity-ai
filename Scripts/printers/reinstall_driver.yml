@@ -1,0 +1,118 @@
+# Nightingale-AI Playbook: Reinstall Printer Driver
+# Removes, purges, and reinstalls a printer driver on Windows.
+# Use when spooler restart fails.
+
+- name: Reinstall Printer Driver
+  hosts: "{{ target_host }}"
+  gather_facts: yes
+  vars:
+    printer_name: "Printer-E"
+    printer_ip: "192.168.1.50"
+    driver_name: "HP Universal Printing PCL 6"
+    driver_inf_path: "\\\\fileserver\\drivers\\HP\\hpcu260u.inf"
+    driver_package: "HP Universal Print Driver"
+
+  tasks:
+    # ===== STEP 1: VERIFY PRINTER IS REACHABLE =====
+    - name: Confirm printer is reachable on network
+      ansible.windows.win_ping:
+      register: printer_ping
+      ignore_errors: yes
+
+    - name: Fail if printer is offline (driver isn't the problem)
+      ansible.builtin.fail:
+        msg: "Printer {{ printer_name }} is unreachable at {{ printer_ip }}. Driver reinstall won't help—this is a network or hardware issue."
+      when: printer_ping.failed | default(false)
+
+    # ===== STEP 2: STOP SPOOLER =====
+    - name: Stop Print Spooler service
+      ansible.windows.win_service:
+        name: Spooler
+        state: stopped
+      register: spooler_stop
+
+    # ===== STEP 3: REMOVE EXISTING PRINTER =====
+    - name: Remove existing printer
+      ansible.windows.win_shell: |
+        Remove-Printer -Name "{{ printer_name }}" -ErrorAction SilentlyContinue
+      register: remove_printer
+      ignore_errors: yes
+
+    - name: Remove existing printer port
+      ansible.windows.win_shell: |
+        Remove-PrinterPort -Name "IP_{{ printer_ip }}" -ErrorAction SilentlyContinue
+      register: remove_port
+      ignore_errors: yes
+
+    # ===== STEP 4: PURGE DRIVER CACHE =====
+    # This is the "nuke it from orbit" step. Deletes cached driver files.
+    - name: Remove cached driver files
+      ansible.windows.win_shell: |
+        Remove-Item -Path "C:\Windows\System32\spool\drivers\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "C:\Windows\System32\spool\PRINTERS\*" -Force -ErrorAction SilentlyContinue
+
+    - name: Remove driver from driver store
+      ansible.windows.win_shell: |
+        pnputil /enum-drivers | Select-String -Pattern "{{ driver_name }}" | ForEach-Object {
+          $inf = ($_ -split ":")[1].Trim()
+          pnputil /delete-driver $inf /uninstall /force
+        }
+      register: purge_drivers
+      ignore_errors: yes
+
+    # ===== STEP 5: REINSTALL DRIVER =====
+    - name: Add printer driver from INF
+      ansible.windows.win_shell: |
+        pnputil /add-driver "{{ driver_inf_path }}" /install
+      register: install_driver
+
+    - name: Recreate printer port
+      ansible.windows.win_shell: |
+        Add-PrinterPort -Name "IP_{{ printer_ip }}" -PrinterHostAddress "{{ printer_ip }}"
+
+    - name: Recreate printer
+      ansible.windows.win_shell: |
+        Add-Printer -Name "{{ printer_name }}" -DriverName "{{ driver_name }}" -PortName "IP_{{ printer_ip }}"
+
+    # ===== STEP 6: RESTART SPOOLER =====
+    - name: Start Print Spooler service
+      ansible.windows.win_service:
+        name: Spooler
+        state: started
+
+    # ===== STEP 7: VERIFY =====
+    - name: Verify printer is installed and online
+      ansible.windows.win_shell: |
+        $printer = Get-Printer -Name "{{ printer_name }}" -ErrorAction SilentlyContinue
+        if ($printer) {
+          $status = Get-Printer -Name "{{ printer_name }}" | Select-Object -ExpandProperty PrinterStatus
+          Write-Output "INSTALLED|$status"
+        } else {
+          Write-Output "MISSING"
+        }
+      register: verify_printer
+
+    - name: Print a test page
+      ansible.windows.win_shell: |
+        $printer = Get-WmiObject -Class Win32_Printer -Filter "Name='{{ printer_name }}'"
+        if ($printer) { $printer.PrintTestPage() | Out-Null }
+      register: test_page
+      ignore_errors: yes
+
+    # ===== STEP 8: RETURN RESULT =====
+    - name: Return structured result
+      ansible.builtin.debug:
+        msg:
+          status: "{{ 'success' if 'INSTALLED' in verify_printer.stdout else 'failure' }}"
+          action: "reinstall_driver"
+          printer: "{{ printer_name }}"
+          printer_status: "{{ verify_printer.stdout }}"
+          test_page_sent: "{{ test_page.failed | default(false) == false }}"
+          error: "{{ verify_printer.stderr if 'MISSING' in verify_printer.stdout else '' }}"
+      register: result
+
+    - name: Write result to disk
+      ansible.builtin.copy:
+        content: "{{ result.msg | to_nice_json }}"
+        dest: "/tmp/nightingale_result.json"
+      changed_when: false
