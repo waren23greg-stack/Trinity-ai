@@ -1,0 +1,91 @@
+# Nightingale-AI Playbook: STP Recalculation
+# Forces Spanning Tree Protocol to reconverge, breaking network loops.
+# Use when multiple downstream devices drop simultaneously.
+
+- name: Force STP Recalculation
+  hosts: core_switch
+  gather_facts: no
+  vars:
+    switch_vendor: "cisco"  # cisco | ubiquiti | hp | juniper
+    stp_mode: "rapid-pvst"  # rapid-pvst | mstp | rstp
+
+  tasks:
+    # ===== STEP 1: CAPTURE PRE-STATE =====
+    - name: Capture STP topology before recalculation
+      ansible.builtin.shell: |
+        {% if switch_vendor == 'cisco' %}
+        show spanning-tree summary
+        {% elif switch_vendor == 'ubiquiti' %}
+        mca-cli-op info | grep -i stp
+        {% endif %}
+      register: stp_pre_state
+      changed_when: false
+
+    # ===== STEP 2: DETECT LOOP =====
+    - name: Check for STP topology change counter
+      ansible.builtin.shell: |
+        {% if switch_vendor == 'cisco' %}
+        show spanning-tree detail | grep "Number of topology changes"
+        {% endif %}
+      register: topology_changes
+      changed_when: false
+
+    - name: Parse topology change count
+      ansible.builtin.set_fact:
+        topology_change_count: "{{ topology_changes.stdout | regex_search('\\d+') | int }}"
+
+    # ===== STEP 3: FORCE RECALCULATION =====
+    # This is the nuclear option: clear STP and let it reconverge.
+    - name: Clear STP topology and force recalculation
+      ansible.builtin.shell: |
+        {% if switch_vendor == 'cisco' %}
+        clear spanning-tree detected-protocols
+        {% elif switch_vendor == 'ubiquiti' %}
+        mca-cli-op set-stp-mode {{ stp_mode }}
+        {% endif %}
+      when: topology_change_count | int > 10  # Only force if changes are excessive
+
+    # ===== STEP 4: WAIT FOR CONVERGENCE =====
+    - name: Wait for STP convergence (30 seconds)
+      ansible.builtin.pause:
+        seconds: 30
+
+    # ===== STEP 5: VERIFY =====
+    - name: Verify STP topology has stabilized
+      ansible.builtin.shell: |
+        {% if switch_vendor == 'cisco' %}
+        show spanning-tree detail | grep "Number of topology changes"
+        {% endif %}
+      register: stp_post_state
+      changed_when: false
+
+    - name: Confirm no new topology changes
+      ansible.builtin.set_fact:
+        stp_stable: "{{ stp_post_state.stdout | regex_search('\\d+') | int <= topology_change_count | int }}"
+
+    # ===== STEP 6: VERIFY DOWNSTREAM DEVICES RECOVERED =====
+    - name: Ping CCTV cameras to verify recovery
+      ansible.builtin.shell: |
+        for ip in {{ cctv_ips }}; do
+          ping -c 2 -W 1 $ip && echo "$ip:UP" || echo "$ip:DOWN"
+        done
+      register: cctv_recovery
+      changed_when: false
+
+    # ===== STEP 7: RETURN STRUCTURED RESULT =====
+    - name: Return result
+      ansible.builtin.debug:
+        msg:
+          status: "{{ 'success' if stp_stable and 'DOWN' not in cctv_recovery.stdout else 'failure' }}"
+          action: "stp_recalculate"
+          pre_change_count: "{{ topology_change_count }}"
+          post_change_count: "{{ stp_post_state.stdout | regex_search('\\d+') }}"
+          stp_stable: "{{ stp_stable }}"
+          cctv_status: "{{ cctv_recovery.stdout }}"
+      register: result
+
+    - name: Write result to disk
+      ansible.builtin.copy:
+        content: "{{ result.msg | to_nice_json }}"
+        dest: "/tmp/nightingale_result.json"
+      changed_when: false
