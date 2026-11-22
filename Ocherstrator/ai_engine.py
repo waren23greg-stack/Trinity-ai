@@ -1,5 +1,5 @@
 """
-Trinity-ai Cognitive Engine
+Nightingale-AI Cognitive Engine
 Uses LangChain ReAct pattern to diagnose infrastructure faults.
 """
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class NightingaleEngine:
     """
-    The reasoning brain of Trinity.
+    The reasoning brain of Nightingale.
     Ingests telemetry, retrieves past incidents, and selects remediation scripts.
     """
     
@@ -63,14 +63,14 @@ class NightingaleEngine:
             Tool(
                 name="escalate_to_human",
                 func=self._escalate,
-                description="Use this ONLY after 3 failed remediation attempts. Generates a Waren Packet."
+                description="Use this ONLY after 3 failed remediation attempts. Generates a Warren Packet."
             )
         ]
     
     def _build_agent(self):
         """Builds the ReAct agent with strict guardrails."""
         prompt = PromptTemplate.from_template("""
-        You are Trinity, an autonomous IT operations agent for a hospital.
+        You are Nightingale, an autonomous IT operations agent for a hospital.
         
         CURRENT TELEMETRY:
         {telemetry}
